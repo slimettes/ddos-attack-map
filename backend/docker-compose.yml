@@ -1,0 +1,124 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: ddos_map_db
+      POSTGRES_USER: ddos_user
+      POSTGRES_PASSWORD: ddos_pass
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ddos_user -d ddos_map_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # FastAPI Backend
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://ddos_user:ddos_pass@postgres:5432/ddos_map_db
+      - REDIS_URL=redis://redis:6379/0
+      - DEBUG=true
+      - LOG_LEVEL=INFO
+      - MOCK_EVENT_GENERATION=true
+      - ENABLE_ABUSEIPDB=false
+      - ENABLE_REAL_RADAR_DATA=false
+      - SECRET_KEY=dev-secret-key-for-docker
+    volumes:
+      - ./app:/app/app:ro  # Mount for development
+      - ./models:/app/models
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # Next.js Frontend (will be added in Phase 5)
+  # web:
+  #   build:
+  #     context: ./frontend
+  #     dockerfile: Dockerfile
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     - NEXT_PUBLIC_API_URL=http://localhost:8000
+  #     - NEXT_PUBLIC_WS_URL=ws://localhost:8000
+  #   depends_on:
+  #     - api
+  #   restart: unless-stopped
+
+  # Database migration runner
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    command: ["python", "-m", "alembic", "upgrade", "head"]
+    environment:
+      - DATABASE_URL=postgresql://ddos_user:ddos_pass@postgres:5432/ddos_map_db
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["migrate"]
+
+  # ML model trainer
+  train-model:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    command: ["python", "scripts/train_model.py"]
+    volumes:
+      - ./models:/app/models
+    environment:
+      - DATABASE_URL=postgresql://ddos_user:ddos_pass@postgres:5432/ddos_map_db
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    profiles: ["train"]
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  default:
+    name: ddos-map-network
